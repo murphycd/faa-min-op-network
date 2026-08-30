@@ -1,35 +1,56 @@
-#!/usr/bin/env uv run
+#!/usr/bin/env -S uv run
+# /// script
+# dependencies = [
+#   "geographiclib",
+#   "numpy",
+#   "openpyxl",
+#   "pandas",
+#   "requests",
+# ]
+# ///
+
 import io
-import os
 import zipfile
 from pathlib import Path
-from urllib.parse import urlparse
-import numpy
 
-import pandas
+import numpy as np
+import pandas as pd
 import requests
+from geographiclib.geodesic import Geodesic
+
 
 # https://www.faa.gov/ato/navigation-programs/vor-retention-list
-vor_retention_source = {
+VOR_RETENTION_SOURCE = {
     "filename": "vor_retention.csv",
     "url": "https://www.faa.gov/sites/faa.gov/files/2022-02/VOR_Retention_List_2022-2-7.xlsx",
     "id_column": "ID",
 }
 
 # https://www.faa.gov/air_traffic/flight_info/aeronav/aero_data/NASR_Subscription/
-nav_data_source = {
+NAV_DATA_SOURCE = {
     "filename": "nav_data.csv",
     "url": "https://nfdc.faa.gov/webContent/28DaySub/extra/03_Sep_2026_NAV_CSV.zip",
     "internal_name": "NAV_BASE.csv",
     "id_column": "NAV_ID",
-    "keep_columns": ["NAV_ID", "NAV_TYPE", "NAME", "LAT_DECIMAL", "LONG_DECIMAL", "ELEV", "MAG_VARN", "ALT_CODE"],
+    "keep_columns": [
+        "NAV_ID",
+        "NAV_TYPE",
+        "NAME",
+        "LAT_DECIMAL",
+        "LONG_DECIMAL",
+        "ELEV",
+        "MAG_VARN",
+        "ALT_CODE",
+    ],
 }
 
-mon_data_constants = {
-    "filename": "mon_data.csv",
-}
+MON_DATA_FILENAME = "mon_data.csv"
 
-_RAW_SERVICE_VOLUMES_VOR = [
+VALID_NAV_TYPES = frozenset({"VOR", "VOR/DME", "VORTAC"})
+
+# Standard service-volume rules:
+# (class, minimum altitude AGL, maximum altitude AGL, maximum distance NM)
+RAW_SERVICE_VOLUMES_VOR = (
     ("T", 1000, 12000, 25),
     ("L", 1000, 18000, 40),
     ("H", 1000, 14499, 40),
@@ -43,133 +64,282 @@ _RAW_SERVICE_VOLUMES_VOR = [
     ("VH", 14500, 17999, 100),
     ("VH", 18000, 45000, 130),
     ("VH", 45001, 60000, 100),
-]
-service_volumes_vor = [
-    {"class": cls, "altitude": {"min": min_alt, "max": max_alt}, "miles": miles}
-    for cls, min_alt, max_alt, miles in _RAW_SERVICE_VOLUMES_VOR
-]
+)
 
-# force redownload data from faa website even if files already exist
+# Force redownload of FAA source data even if cached files already exist.
 REDOWNLOAD = False
 
-# force reparse of downloaded data into mon_data even if file already exists
+# Force reconstruction of MON data even if the cached MON file exists.
 REPARSE = False
 
+# WGS84 ellipsoid used for the geodesic destination calculation.
+WGS84 = Geodesic.WGS84
 
-def main():
 
-    working_dir = Path(__file__).parent / "data"
+def main() -> None:
+    working_dir = Path(__file__).resolve().parent / "data"
     working_dir.mkdir(exist_ok=True)
 
     mon_data = get_mon_data(working_dir)
 
-    #print(mon_data) # debug
-    
     frd_data = generate_frd_data(
         nav_set_df=mon_data,
-        step_size=1,
-        start_dist=0,
-        end_dist=130,
-        start_radial=0,
-        end_radial=359,
-        radial_step=1,
+        step_dist=1.0,
+        start_dist=0.0,
+        end_dist=130.0,
+        start_radial=0.0,
+        end_radial=359.0,
+        radial_step=1.0,
     )
 
     print(frd_data)
 
 
-def generate_frd_data(
-    nav_set_df,
-    step_size=1,
-    start_dist=0,
-    end_dist=130,
-    start_radial=0,
-    end_radial=359,
-    radial_step=1,
-):
-    """For each starting point in nav_set_df, generates an FRD grid from start
+def get_mon_data(working_dir: Path) -> pd.DataFrame:
+    mon_data_file = working_dir / MON_DATA_FILENAME
 
-    to end distance and start to end radial (inclusive).
+    if REPARSE or not mon_data_file.is_file():
+        print(f"Constructing MON data at {mon_data_file}...")
+        mon_data = construct_mon_data(working_dir)
+    else:
+        print(f"Loading MON data from {mon_data_file}...")
+        mon_data = pd.read_csv(mon_data_file)
+
+    return mon_data
+
+
+def construct_mon_data(working_dir: Path) -> pd.DataFrame:
+    # Load or fetch RET data.
+    ret_file = working_dir / VOR_RETENTION_SOURCE["filename"]
+    if REDOWNLOAD or not ret_file.is_file():
+        url = VOR_RETENTION_SOURCE["url"]
+        print(f"Fetching RET data from {url}...")
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        ret_data = pd.read_excel(io.BytesIO(response.content))
+        ret_data = strip_metadata_rows(ret_data)
+        ret_data.to_csv(ret_file, index=False)
+    else:
+        print(f"Loading RET data from {ret_file}...")
+        ret_data = pd.read_csv(ret_file)
+
+    # Load or fetch NAV data.
+    nav_data_file = working_dir / NAV_DATA_SOURCE["filename"]
+    if REDOWNLOAD or not nav_data_file.is_file():
+        url = NAV_DATA_SOURCE["url"]
+        print(f"Fetching NAV data from {url}...")
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+
+        with zipfile.ZipFile(io.BytesIO(response.content)) as zip_file:
+            internal_name = NAV_DATA_SOURCE["internal_name"]
+            if internal_name not in zip_file.namelist():
+                raise ValueError(
+                    f"{internal_name!r} was not found in FAA NAV archive"
+                )
+
+            with zip_file.open(internal_name) as file:
+                nav_data = pd.read_csv(file)
+
+        nav_data.to_csv(nav_data_file, index=False)
+    else:
+        print(f"Loading NAV data from {nav_data_file}...")
+        nav_data = pd.read_csv(nav_data_file)
+
+    required_nav_columns = set(NAV_DATA_SOURCE["keep_columns"])
+    missing_nav_columns = required_nav_columns - set(nav_data.columns)
+    if missing_nav_columns:
+        raise ValueError(
+            f"NAV data is missing required columns: "
+            f"{sorted(missing_nav_columns)}"
+        )
+
+    required_ret_columns = {VOR_RETENTION_SOURCE["id_column"]}
+    missing_ret_columns = required_ret_columns - set(ret_data.columns)
+    if missing_ret_columns:
+        raise ValueError(
+            f"RET data is missing required columns: "
+            f"{sorted(missing_ret_columns)}"
+        )
+
+    # Keep NAV facilities whose IDs occur in the VOR retention list.
+    valid_ids = set(ret_data[VOR_RETENTION_SOURCE["id_column"]])
+    nav_data = nav_data[
+        nav_data[NAV_DATA_SOURCE["id_column"]].isin(valid_ids)
+    ]
+
+    # Keep VOR-type facilities only.
+    nav_data = nav_data[
+        nav_data["NAV_TYPE"].isin(VALID_NAV_TYPES)
+    ].copy()
+
+    # Keep only the columns required downstream.
+    nav_data = nav_data.loc[
+        :,
+        NAV_DATA_SOURCE["keep_columns"],
+    ].reset_index(drop=True)
+
+    # Normalize critical numeric fields before caching MON data.
+    numeric_columns = [
+        "LAT_DECIMAL",
+        "LONG_DECIMAL",
+        "ELEV",
+        "MAG_VARN",
+    ]
+    nav_data[numeric_columns] = nav_data[numeric_columns].apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+
+    validate_nav_set(nav_data)
+
+    mon_data_file = working_dir / MON_DATA_FILENAME
+    nav_data.to_csv(mon_data_file, index=False)
+    print(f"Saved MON data to {mon_data_file}...")
+
+    return nav_data
+
+
+def strip_metadata_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Locate the RET header using known column names and remove preceding rows."""
+    expected_columns = {"ID"}
+    header_idx = None
+
+    for idx in range(len(df)):
+        values = set(df.iloc[idx].dropna().astype(str).str.strip())
+        if expected_columns.issubset(values):
+            header_idx = idx
+            break
+
+    if header_idx is None:
+        raise ValueError("Could not locate RET header row containing 'ID'")
+
+    new_columns = (
+        df.iloc[header_idx]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .tolist()
+    )
+
+    df_cleaned = df.iloc[header_idx + 1 :].copy()
+    df_cleaned.columns = new_columns
+
+    return df_cleaned.reset_index(drop=True)
+
+
+def generate_frd_data(
+    nav_set_df: pd.DataFrame,
+    step_dist: float, # nautical miles
+    start_dist: float, # nautical miles
+    end_dist: float,
+    start_radial: float, # magnetic degrees
+    end_radial: float, # inclusive
+    radial_step: float,
+) -> pd.DataFrame:
+    """Generate an FRD grid around each VOR in ``nav_set_df``.
+
+    Distances are in nautical miles and radials are magnetic degrees.
+    The distance and radial endpoints are inclusive and must fall exactly
+    on their respective step sizes.
+
+    At distance zero, only one point is generated and its radial is
+    conventionally set to zero.
     """
-    # 1. Generate 1D ranges for both dimensions
-    radial_range = numpy.arange(
-        start_radial, end_radial + radial_step, radial_step
+    validate_grid_parameters(
+        step_size=step_dist,
+        start_dist=start_dist,
+        end_dist=end_dist,
+        start_radial=start_radial,
+        end_radial=end_radial,
+        radial_step=radial_step,
+    )
+    validate_nav_set(nav_set_df)
+
+    radial_range = make_inclusive_range(
+        start=start_radial,
+        end=end_radial,
+        step=radial_step,
     )
 
     if start_dist == 0:
-        # Exclude origin from grid expansion to avoid radial redundancy at zero distance
-        non_zero_dists = numpy.arange(
-            start_dist + step_size, end_dist + step_size, step_size
+        non_zero_dists = make_inclusive_range(
+            start=start_dist + step_dist,
+            end=end_dist,
+            step=step_dist,
         )
-        dist_grid, radial_grid = numpy.meshgrid(non_zero_dists, radial_range)
-
-        # 2. Flatten grid combinations and prepend a single origin point
-        step_dists = numpy.hstack(([0], dist_grid.ravel()))[numpy.newaxis, :]
-        step_radials = numpy.hstack(([start_radial], radial_grid.ravel()))[
-            numpy.newaxis, :
-        ]
+        if non_zero_dists.size:
+            dist_grid, radial_grid = np.meshgrid(
+                non_zero_dists,
+                radial_range,
+                indexing="xy",
+            )
+            step_dists = np.hstack(([0.0], dist_grid.ravel()))
+            step_radials = np.hstack(([0.0], radial_grid.ravel()))
+        else:
+            step_dists = np.array([0.0])
+            step_radials = np.array([0.0])
     else:
-        dist_range = numpy.arange(start_dist, end_dist + step_size, step_size)
-        dist_grid, radial_grid = numpy.meshgrid(dist_range, radial_range)
-        step_dists = dist_grid.ravel()[numpy.newaxis, :]
-        step_radials = radial_grid.ravel()[numpy.newaxis, :]
+        dist_range = make_inclusive_range(
+            start=start_dist,
+            end=end_dist,
+            step=step_dist,
+        )
+        dist_grid, radial_grid = np.meshgrid(
+            dist_range,
+            radial_range,
+            indexing="xy",
+        )
+        step_dists = dist_grid.ravel()
+        step_radials = radial_grid.ravel()
 
-    points_per_seed = step_dists.shape[1]
-    # 4. Convert input columns to 2D column vectors: Shape (N, 1)
-    lats = nav_set_df["LAT_DECIMAL"].to_numpy()[:, numpy.newaxis]
-    lons = nav_set_df["LONG_DECIMAL"].to_numpy()[:, numpy.newaxis]
-    mag_vars = nav_set_df["MAG_VARN"].to_numpy()[:, numpy.newaxis]
+    points_per_seed = step_dists.size
 
-    # 5. Execute the custom calculation logic
-    # Outputs will all have the shape: (N, total_combinations)
-    new_lat, new_lon, new_radial, new_dist = custom_point_logic(
-        lats, lons, mag_vars, step_radials, step_dists
+    lats = nav_set_df["LAT_DECIMAL"].to_numpy(dtype=float)[:, np.newaxis]
+    lons = nav_set_df["LONG_DECIMAL"].to_numpy(dtype=float)[:, np.newaxis]
+    mag_vars = nav_set_df["MAG_VARN"].to_numpy(dtype=float)[:, np.newaxis]
+
+    new_lat, new_lon = calc_frd_to_lat_lon(
+        lats=lats,
+        lons=lons,
+        mag_vars=mag_vars,
+        step_radials=step_radials[np.newaxis, :],
+        step_dists=step_dists[np.newaxis, :],
     )
 
-    # 6. Flatten the 2D structures into 1D vectors for the final table
     flat_lat = new_lat.ravel()
     flat_lon = new_lon.ravel()
-    flat_radial = new_radial.ravel()
-    flat_dist = new_dist.ravel()
+    flat_radial = np.broadcast_to(
+        step_radials[np.newaxis, :],
+        new_lat.shape,
+    ).ravel()
+    flat_dist = np.broadcast_to(
+        step_dists[np.newaxis, :],
+        new_lat.shape,
+    ).ravel()
 
-    # 7. Repeat structural tracking metadata (IDs, SSVs, Elev) so rows align perfectly
-    flat_ids = numpy.repeat(nav_set_df["NAV_ID"].to_numpy(), points_per_seed)
-    flat_ssvs = numpy.repeat(nav_set_df["ALT_CODE"].to_numpy(), points_per_seed)
-    
-    elevs = pandas.to_numeric(nav_set_df["ELEV"], errors="coerce").to_numpy()
-    flat_elev = numpy.repeat(elevs, points_per_seed)
+    flat_ids = np.repeat(
+        nav_set_df["NAV_ID"].to_numpy(),
+        points_per_seed,
+    )
+    flat_ssvs = np.repeat(
+        nav_set_df["ALT_CODE"].to_numpy(),
+        points_per_seed,
+    )
 
-    # Initialize continuous bounding arrays for altitude limits
-    flat_min_alt = numpy.full(flat_dist.shape, numpy.nan)
-    flat_max_alt = numpy.full(flat_dist.shape, numpy.nan)
+    elevs = pd.to_numeric(
+        nav_set_df["ELEV"],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+    flat_elev = np.repeat(elevs, points_per_seed)
 
-    # Greedily concatenate and evaluate intervals per unique SSV class
-    for ssv_class in numpy.unique(flat_ssvs):
-        class_mask = (flat_ssvs == ssv_class)
-        class_dists = flat_dist[class_mask]
+    flat_min_alt, flat_max_alt = calculate_service_volume_altitudes(
+        ssvs=flat_ssvs,
+        distances=flat_dist,
+        elevations=flat_elev,
+    )
 
-        class_min = numpy.full(class_dists.shape, numpy.inf)
-        class_max = numpy.full(class_dists.shape, -numpy.inf)
-
-        rules = [r for r in _RAW_SERVICE_VOLUMES_VOR if r[0] == ssv_class]
-        for _, r_min, r_max, r_dist in rules:
-            valid_dist = class_dists <= r_dist
-            class_min[valid_dist] = numpy.minimum(class_min[valid_dist], r_min)
-            class_max[valid_dist] = numpy.maximum(class_max[valid_dist], r_max)
-
-        out_of_bounds = (class_min == numpy.inf)
-        class_min[out_of_bounds] = numpy.nan
-        class_max[out_of_bounds] = numpy.nan
-
-        flat_min_alt[class_mask] = class_min
-        flat_max_alt[class_mask] = class_max
-
-    # Add station elevation uniformly to convert ATH to MSL
-    flat_min_alt += flat_elev
-    flat_max_alt += flat_elev
-
-    # 8. Construct the final massive DataFrame exactly once
-    output_df = pandas.DataFrame(
+    return pd.DataFrame(
         {
             "parent_id": flat_ids,
             "generated_lat": flat_lat,
@@ -181,144 +351,238 @@ def generate_frd_data(
         }
     )
 
-    return output_df
 
+def calc_frd_to_lat_lon(
+    lats: np.ndarray,
+    lons: np.ndarray,
+    mag_vars: np.ndarray,
+    step_radials: np.ndarray,
+    step_dists: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Calculate WGS84 destination points from VOR positions.
 
-def custom_point_logic(lats, lons, mag_vars, step_radials, step_dists):
-    """Your custom navigation/geospatial math goes here.
+    ``step_radials`` are magnetic bearings. FAA ``MAG_VARN`` is expected to
+    use the convention that easterly variation is negative and westerly
+    variation is positive, so true bearing is magnetic bearing plus
+    magnetic variation.
 
-    Inputs are shaped for 2D broadcasting:
-    - lats, lons, mag_vars: Shape (N, 1)
-    - step_radials, step_dists:   Shape (1, execution_steps)
-
-    Returns: Four arrays of shape (N, execution_steps)
+    Distances are in nautical miles. GeographicLib performs the direct
+    geodesic calculation on the WGS84 ellipsoid.
     """
-    # Adjust radial by magnetic variation to obtain true bearing
-    true_bearing = step_radials + mag_vars  # Shape: (N, execution_steps)
+    true_bearing = step_radials + mag_vars
 
-    # Convert angular quantities to radians for spherical trigonometry
-    bearing_rad = numpy.radians(true_bearing)
-    lat_rad = numpy.radians(lats)
-    lon_rad = numpy.radians(lons)
+    # GeographicLib accepts degrees and meters. Convert nautical miles to
+    # meters using the international nautical mile definition.
+    distance_m = step_dists * 1852.0
 
-    # Angular distance delta (assuming 1 nautical mile = 1/60th of a degree arc)
-    angular_dist = numpy.radians(step_dists / 60.0)
-
-    # Great circle destination calculation (spherical direct geodesic problem)
-    sin_lat = numpy.sin(lat_rad)
-    cos_lat = numpy.cos(lat_rad)
-    sin_delta = numpy.sin(angular_dist)
-    cos_delta = numpy.cos(angular_dist)
-    sin_bearing = numpy.sin(bearing_rad)
-    cos_bearing = numpy.cos(bearing_rad)
-
-    new_lat_rad = numpy.arcsin(
-        sin_lat * cos_delta + cos_lat * sin_delta * cos_bearing
-    )
-    new_lon_rad = lon_rad + numpy.arctan2(
-        sin_bearing * sin_delta * cos_lat,
-        cos_delta - sin_lat * numpy.sin(new_lat_rad),
+    # GeographicLib's Python API is scalar-oriented, so calculate each
+    # station/grid combination in a vectorized-friendly flattened loop.
+    # The resulting arrays are reshaped to the original broadcast shape.
+    output_shape = np.broadcast_shapes(
+        lats.shape,
+        lons.shape,
+        true_bearing.shape,
+        distance_m.shape,
     )
 
-    new_lat = numpy.degrees(new_lat_rad)
-    new_lon = numpy.degrees(new_lon_rad)
+    lat_values = np.broadcast_to(lats, output_shape).ravel()
+    lon_values = np.broadcast_to(lons, output_shape).ravel()
+    bearing_values = np.broadcast_to(true_bearing, output_shape).ravel()
+    distance_values = np.broadcast_to(distance_m, output_shape).ravel()
 
-    # Wrap longitudes to standard [-180, 180] degree range
-    new_lon = (new_lon + 180.0) % 360.0 - 180.0
+    new_lat = np.empty(lat_values.size, dtype=float)
+    new_lon = np.empty(lon_values.size, dtype=float)
 
-    # Track output metrics (pass the grids through so they map to rows)
-    # Multiplying by numpy.ones_like(lats) ensures it expands to shape (N, execution_steps)
-    new_radial = step_radials * numpy.ones_like(lats)
-    new_dist = step_dists * numpy.ones_like(lats)
+    for i, (lat, lon, bearing, distance) in enumerate(
+        zip(
+            lat_values,
+            lon_values,
+            bearing_values,
+            distance_values,
+            strict=True,
+        )
+    ):
+        result = WGS84.Direct(
+            lat,
+            lon,
+            bearing,
+            distance,
+        )
+        new_lat[i] = result["lat2"]
+        new_lon[i] = result["lon2"]
 
-    return new_lat, new_lon, new_radial, new_dist
-
-
-def get_mon_data(working_dir):
-    mon_data_file = working_dir / mon_data_constants["filename"]
-    if REPARSE or not mon_data_file.is_file():
-        print(f"MON data file {mon_data_file} not found. Constructing MON data...")
-        mon_data = construct_mon_data(working_dir)
-    else:
-        print(f"Loading MON data from {mon_data_file}...")
-        mon_data = pandas.read_csv(mon_data_file)
-        
-    return mon_data
-
-
-def construct_mon_data(working_dir):
-    # load or fetch RET data
-    ret_file = working_dir / vor_retention_source["filename"]
-    if REDOWNLOAD or not ret_file.is_file():
-        print(f"Fetching RET data from {vor_retention_source['url']}...")
-        response = requests.get(vor_retention_source["url"])
-        response.raise_for_status()
-        ret_data = pandas.read_excel(io.BytesIO(response.content))
-        ret_data = strip_metadata_rows(ret_data)
-        ret_data.to_csv(ret_file, index=False)
-    else:
-        print(f"Loading RET data from {ret_file}...")
-        ret_data = pandas.read_csv(ret_file)
-
-    # load or fetch NAV data
-    nav_data_file = working_dir / nav_data_source["filename"]
-    if REDOWNLOAD or not nav_data_file.is_file():
-        print(f"Fetching NAV data from {nav_data_source['url']}...")
-        response = requests.get(nav_data_source["url"])
-        response.raise_for_status()
-        with zipfile.ZipFile(io.BytesIO(response.content)) as zip_file:
-            with zip_file.open(nav_data_source["internal_name"]) as file:
-                nav_data = pandas.read_csv(file)
-        nav_data.to_csv(nav_data_file, index=False)
-    else:
-        print(f"Loading NAV data from {nav_data_file}...")
-        nav_data = pandas.read_csv(nav_data_file)
-
-    # Remove NAV rows not found in the RET ID column
-    valid_ids = set(ret_data[vor_retention_source["id_column"]])
-    invalid_row_mask = ~nav_data[nav_data_source["id_column"]].isin(valid_ids)
-    nav_data.drop(index=nav_data[invalid_row_mask].index, inplace=True)
-
-    # Keep VOR-type facilities only
-    valid_nav_types = ["VOR", "VOR/DME", "VORTAC"]
-    non_vor_mask = ~nav_data["NAV_TYPE"].isin(valid_nav_types)
-    nav_data.drop(index=nav_data[non_vor_mask].index, inplace=True)
-
-    # Remove unlisted columns
-    unwanted_columns = nav_data.columns.difference(nav_data_source["keep_columns"])
-    nav_data.drop(columns=unwanted_columns, inplace=True)
-
-    # Reset index after row/column operations
-    nav_data.reset_index(drop=True, inplace=True)
-
-    mon_data_file = working_dir / mon_data_constants["filename"]
-    nav_data.to_csv(mon_data_file, index=False)
-    print(f"Saved MON data to {mon_data_file}...")
-
-    return nav_data
+    return new_lat.reshape(output_shape), new_lon.reshape(output_shape)
 
 
-def strip_metadata_rows(df: pandas.DataFrame) -> pandas.DataFrame:
-    # The header row in poorly formatted tabular exports typically represents the first
-    # fully populated row. idxmax() returns the first occurrence of the maximum non-null count,
-    # reliably isolating the header from sparse metadata rows above it.
-    valid_counts = df.notna().sum(axis=1)
-    header_idx = valid_counts.idxmax()
+def calculate_service_volume_altitudes(
+    ssvs: np.ndarray,
+    distances: np.ndarray,
+    elevations: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Calculate continuous SSV altitude limits for each generated point.
 
-    # Casting to string ensures uniform column name types, mitigating issues
-    # with mixed-type inference from the original row values.
-    new_columns = (
-        df.iloc[header_idx]  # pyright: ignore[reportArgumentType, reportCallIssue]
-        .fillna("")
-        .astype(str)
-        .tolist()
+    A point at distance D is in every service-volume band for its SSV class
+    whose radius is at least D. Therefore, overlapping bands are combined
+    using the lowest applicable minimum altitude and highest applicable
+    maximum altitude.
+    """
+    min_alt = np.full(distances.shape, np.nan, dtype=float)
+    max_alt = np.full(distances.shape, np.nan, dtype=float)
+
+    for ssv_class in pd.unique(ssvs):
+        if pd.isna(ssv_class):
+            continue
+
+        class_mask = ssvs == ssv_class
+        class_distances = distances[class_mask]
+
+        class_min = np.full(class_distances.shape, np.inf, dtype=float)
+        class_max = np.full(class_distances.shape, -np.inf, dtype=float)
+
+        rules = [
+            rule
+            for rule in RAW_SERVICE_VOLUMES_VOR
+            if rule[0] == ssv_class
+        ]
+
+        if not rules:
+            raise ValueError(
+                f"Unsupported service-volume class in ALT_CODE: {ssv_class!r}"
+            )
+
+        for _, min_ath, max_ath, max_distance in rules:
+            applicable = class_distances <= max_distance
+            class_min[applicable] = np.minimum(
+                class_min[applicable],
+                min_ath,
+            )
+            class_max[applicable] = np.maximum(
+                class_max[applicable],
+                max_ath,
+            )
+
+        out_of_bounds = np.isinf(class_min)
+        class_min[out_of_bounds] = np.nan
+        class_max[out_of_bounds] = np.nan
+
+        min_alt[class_mask] = class_min + elevations[class_mask]
+        max_alt[class_mask] = class_max + elevations[class_mask]
+
+    return min_alt, max_alt
+
+
+def validate_grid_parameters(
+    *,
+    step_size: float,
+    start_dist: float,
+    end_dist: float,
+    start_radial: float,
+    end_radial: float,
+    radial_step: float,
+) -> None:
+    """Validate grid parameters and enforce inclusive, step-aligned endpoints."""
+    if step_size <= 0:
+        raise ValueError("step_size must be positive")
+
+    if radial_step <= 0:
+        raise ValueError("radial_step must be positive")
+
+    if start_dist < 0:
+        raise ValueError("start_dist must not be negative")
+
+    if start_dist > end_dist:
+        raise ValueError("start_dist must not exceed end_dist")
+
+    if start_radial > end_radial:
+        raise ValueError("start_radial must not exceed end_radial")
+
+    if not is_step_aligned(start_dist, end_dist, step_size):
+        raise ValueError(
+            "end_dist must be reachable from start_dist using step_size; "
+            "the endpoint is inclusive and cannot be silently overshot"
+        )
+
+    if not is_step_aligned(start_radial, end_radial, radial_step):
+        raise ValueError(
+            "end_radial must be reachable from start_radial using radial_step; "
+            "the endpoint is inclusive and cannot be silently overshot"
+        )
+
+
+def is_step_aligned(start: float, end: float, step: float) -> bool:
+    """Return whether ``end`` is an integer number of steps from ``start``."""
+    steps = (end - start) / step
+    return np.isclose(steps, round(steps), rtol=0.0, atol=1e-10)
+
+
+def make_inclusive_range(
+    *,
+    start: float,
+    end: float,
+    step: float,
+) -> np.ndarray:
+    """Return a fixed-step range whose endpoint is guaranteed inclusive."""
+    count = int(round((end - start) / step))
+    return start + np.arange(count + 1, dtype=float) * step
+
+
+def validate_nav_set(nav_set_df: pd.DataFrame) -> None:
+    """Validate columns and numeric geographic inputs required by FRD generation."""
+    required_columns = {
+        "NAV_ID",
+        "LAT_DECIMAL",
+        "LONG_DECIMAL",
+        "ELEV",
+        "MAG_VARN",
+        "ALT_CODE",
+    }
+    missing_columns = required_columns - set(nav_set_df.columns)
+    if missing_columns:
+        raise ValueError(
+            f"MON data is missing required columns: {sorted(missing_columns)}"
+        )
+
+    if nav_set_df.empty:
+        raise ValueError("MON data contains no navigation facilities")
+
+    numeric_columns = [
+        "LAT_DECIMAL",
+        "LONG_DECIMAL",
+        "MAG_VARN",
+    ]
+    for column in numeric_columns:
+        values = pd.to_numeric(
+            nav_set_df[column],
+            errors="coerce",
+        )
+        if values.isna().any():
+            raise ValueError(
+                f"MON data contains non-numeric or missing values in {column!r}"
+            )
+
+    latitudes = pd.to_numeric(
+        nav_set_df["LAT_DECIMAL"],
+        errors="coerce",
     )
-    df_cleaned = df.iloc[
-        header_idx + 1 :  # pyright: ignore[reportOperatorIssue]
-    ].copy()
-    df_cleaned.columns = new_columns
+    longitudes = pd.to_numeric(
+        nav_set_df["LONG_DECIMAL"],
+        errors="coerce",
+    )
 
-    return df_cleaned.reset_index(drop=True)
+    if not latitudes.between(-90.0, 90.0).all():
+        raise ValueError("MON data contains latitude outside [-90, 90]")
+
+    if not longitudes.between(-180.0, 180.0).all():
+        raise ValueError("MON data contains longitude outside [-180, 180]")
+
+    unknown_ssvs = set(nav_set_df["ALT_CODE"].dropna()) - {
+        rule[0] for rule in RAW_SERVICE_VOLUMES_VOR
+    }
+    if unknown_ssvs:
+        raise ValueError(
+            f"MON data contains unsupported ALT_CODE values: "
+            f"{sorted(unknown_ssvs)}"
+        )
 
 
 if __name__ == "__main__":
