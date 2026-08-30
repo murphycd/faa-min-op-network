@@ -49,7 +49,7 @@ service_volumes_vor = [
     for cls, min_alt, max_alt, miles in _RAW_SERVICE_VOLUMES_VOR
 ]
 
-# force redownload data from faa website even if files alrrady exist
+# force redownload data from faa website even if files already exist
 REDOWNLOAD = False
 
 # force reparse of downloaded data into mon_data even if file already exists
@@ -119,12 +119,11 @@ def generate_frd_data(
     lats = nav_set_df["LAT_DECIMAL"].to_numpy()[:, numpy.newaxis]
     lons = nav_set_df["LONG_DECIMAL"].to_numpy()[:, numpy.newaxis]
     mag_vars = nav_set_df["MAG_VARN"].to_numpy()[:, numpy.newaxis]
-    ssvs = nav_set_df["ALT_CODE"].to_numpy()[:, numpy.newaxis]
 
     # 5. Execute the custom calculation logic
     # Outputs will all have the shape: (N, total_combinations)
     new_lat, new_lon, new_radial, new_dist = custom_point_logic(
-        lats, lons, mag_vars, ssvs, step_radials, step_dists
+        lats, lons, mag_vars, step_radials, step_dists
     )
 
     # 6. Flatten the 2D structures into 1D vectors for the final table
@@ -133,8 +132,9 @@ def generate_frd_data(
     flat_radial = new_radial.ravel()
     flat_dist = new_dist.ravel()
 
-    # 7. Repeat structural tracking metadata (IDs) so rows align perfectly
+    # 7. Repeat structural tracking metadata (IDs, SSVs) so rows align perfectly
     flat_ids = numpy.repeat(nav_set_df["NAV_ID"].to_numpy(), points_per_seed)
+    flat_ssvs = numpy.repeat(nav_set_df["ALT_CODE"].to_numpy(), points_per_seed)
 
     # 8. Construct the final massive DataFrame exactly once
     output_df = pandas.DataFrame(
@@ -144,17 +144,18 @@ def generate_frd_data(
             "generated_lon": flat_lon,
             "radial": flat_radial,
             "distance": flat_dist,
+            "ssv": flat_ssvs,
         }
     )
 
     return output_df
 
 
-def custom_point_logic(lats, lons, mag_vars, ssvs, step_radials, step_dists):
+def custom_point_logic(lats, lons, mag_vars, step_radials, step_dists):
     """Your custom navigation/geospatial math goes here.
 
     Inputs are shaped for 2D broadcasting:
-    - lats, lons, mag_vars, ssvs: Shape (N, 1)
+    - lats, lons, mag_vars: Shape (N, 1)
     - step_radials, step_dists:   Shape (1, execution_steps)
 
     Returns: Four arrays of shape (N, execution_steps)
