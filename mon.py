@@ -35,14 +35,14 @@ _RAW_SERVICE_VOLUMES_VOR = [
     ("H", 1000, 14499, 40),
     ("H", 14500, 17999, 100),
     ("H", 18000, 45000, 130),
-    ("H", 45000, 99999, 100),
+    ("H", 45000, 60000, 100),
     ("VL", 1000, 4999, 40),
     ("VL", 5000, 17999, 70),
     ("VH", 1000, 4999, 40),
     ("VH", 5000, 14499, 70),
     ("VH", 14500, 17999, 100),
     ("VH", 18000, 45000, 130),
-    ("VH", 45000, 99999, 100),
+    ("VH", 45001, 60000, 100),
 ]
 service_volumes_vor = [
     {"class": cls, "altitude": {"min": min_alt, "max": max_alt}, "miles": miles}
@@ -63,7 +63,7 @@ def main():
 
     mon_data = get_mon_data(working_dir)
 
-    print(mon_data) # debug
+    #print(mon_data) # debug
     
     frd_data = generate_frd_data(
         nav_set_df=mon_data,
@@ -132,9 +132,41 @@ def generate_frd_data(
     flat_radial = new_radial.ravel()
     flat_dist = new_dist.ravel()
 
-    # 7. Repeat structural tracking metadata (IDs, SSVs) so rows align perfectly
+    # 7. Repeat structural tracking metadata (IDs, SSVs, Elev) so rows align perfectly
     flat_ids = numpy.repeat(nav_set_df["NAV_ID"].to_numpy(), points_per_seed)
     flat_ssvs = numpy.repeat(nav_set_df["ALT_CODE"].to_numpy(), points_per_seed)
+    
+    elevs = pandas.to_numeric(nav_set_df["ELEV"], errors="coerce").to_numpy()
+    flat_elev = numpy.repeat(elevs, points_per_seed)
+
+    # Initialize continuous bounding arrays for altitude limits
+    flat_min_alt = numpy.full(flat_dist.shape, numpy.nan)
+    flat_max_alt = numpy.full(flat_dist.shape, numpy.nan)
+
+    # Greedily concatenate and evaluate intervals per unique SSV class
+    for ssv_class in numpy.unique(flat_ssvs):
+        class_mask = (flat_ssvs == ssv_class)
+        class_dists = flat_dist[class_mask]
+
+        class_min = numpy.full(class_dists.shape, numpy.inf)
+        class_max = numpy.full(class_dists.shape, -numpy.inf)
+
+        rules = [r for r in _RAW_SERVICE_VOLUMES_VOR if r[0] == ssv_class]
+        for _, r_min, r_max, r_dist in rules:
+            valid_dist = class_dists <= r_dist
+            class_min[valid_dist] = numpy.minimum(class_min[valid_dist], r_min)
+            class_max[valid_dist] = numpy.maximum(class_max[valid_dist], r_max)
+
+        out_of_bounds = (class_min == numpy.inf)
+        class_min[out_of_bounds] = numpy.nan
+        class_max[out_of_bounds] = numpy.nan
+
+        flat_min_alt[class_mask] = class_min
+        flat_max_alt[class_mask] = class_max
+
+    # Add station elevation uniformly to convert ATH to MSL
+    flat_min_alt += flat_elev
+    flat_max_alt += flat_elev
 
     # 8. Construct the final massive DataFrame exactly once
     output_df = pandas.DataFrame(
@@ -144,7 +176,8 @@ def generate_frd_data(
             "generated_lon": flat_lon,
             "radial": flat_radial,
             "distance": flat_dist,
-            "ssv": flat_ssvs,
+            "min_alt": flat_min_alt,
+            "max_alt": flat_max_alt,
         }
     )
 
