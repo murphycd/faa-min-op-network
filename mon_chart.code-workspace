@@ -1,0 +1,52 @@
+{
+    "folders": [
+        {
+            "name": "mon_chart",
+            "path": "."
+        }
+    ],
+    "settings": {
+        "editor.wordWrapColumn": 120,
+
+        "python.testing.pytestEnabled": true,
+        "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+        "python.analysis.typeCheckingMode": "standard",
+        "[python]": {
+            "editor.defaultFormatter": "mikoz.composite-formatter",
+            "editor.formatOnSave": false,
+        },
+
+        "composite-formatter.language": "python",
+        "composite-formatter.formatters": [
+            "mikoz.isort-formatter",
+            "ms-python.black-formatter"
+        ]
+    },
+    "extensions": {
+        "recommendations": [
+            "ms-python.python",
+            "mikoz.isort-formatter",
+            "ms-python.black-formatter"
+        ],
+        "unwantedRecommendations": []
+    },
+    "tasks": {
+        "version": "2.0.0",
+        "tasks": [
+            {
+                "label": "My Task",
+                "command": "uv run mon",
+                "type": "shell",
+                "presentation": {
+                    "reveal": "always",
+                    "clear": true,
+                    "close": false,
+                },
+                "group": {
+                    "kind": "build",
+                    "isDefault": true
+                }
+            }
+        ]
+    }
+}

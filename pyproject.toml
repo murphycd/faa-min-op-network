@@ -1,0 +1,18 @@
+[project]
+name = "MON"
+version = "0.1.0"
+description = "Minimum Operational Network"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "pandas",
+    "openpyxl",
+    "requests",
+    "isort",
+]
+
+[project.scripts]
+mon = "mon:main"
+
+[tool.uv]
+package = true
