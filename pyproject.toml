@@ -10,6 +10,7 @@ dependencies = [
     "openpyxl",
     "requests",
     "isort",
+    "pyarrow>=25.0.1",
 ]
 
 [project.scripts]
@@ -17,3 +18,6 @@ mon = "mon:main"
 
 [tool.uv]
 package = true
+
+[tool.setuptools]
+py-modules = ["mon"]

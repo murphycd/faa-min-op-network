@@ -13,12 +13,14 @@
 import io
 import logging
 import zipfile
+from collections.abc import Hashable, Mapping
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import requests
 from geographiclib.geodesic import Geodesic
+from pandas._typing import DtypeArg
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,36 @@ FRD_DATA_FILENAME = "frd_data.parquet"
 
 VALID_NAV_TYPES = frozenset({"VOR", "VOR/DME", "VORTAC"})
 
+# Strictly type alphanumeric identifiers to prevent pandas from coercing them (e.g. VOR ID "00A")
+CSV_DTYPE_MAP = Mapping[Hashable, DtypeArg]
+
+NAV_SCHEMA: CSV_DTYPE_MAP = {
+    "NAV_ID": "str",
+    "NAV_TYPE": "str",
+    "ALT_CODE": "str",
+}
+
+MON_SCHEMA: CSV_DTYPE_MAP = {
+    "NAV_ID": "str",
+    "NAV_TYPE": "str",
+    "NAME": "str",
+    "LAT_DECIMAL": "float",
+    "LONG_DECIMAL": "float",
+    "ELEV": "float",
+    "MAG_VARN": "float",
+    "ALT_CODE": "str",
+}
+
+FRD_COLUMNS = [
+    "parent_id",
+    "generated_lat",
+    "generated_lon",
+    "radial",
+    "distance",
+    "min_alt",
+    "max_alt",
+]
+
 # Standard service-volume rules:
 # (class, minimum altitude AGL, maximum altitude AGL, maximum distance NM)
 RAW_SERVICE_VOLUMES_VOR = (
@@ -73,7 +105,7 @@ RAW_SERVICE_VOLUMES_VOR = (
 )
 
 # Force redownload of FAA source data even if cached files already exist.
-REDOWNLOAD = False
+REDOWNLOAD_VOR_RET = False
 
 # Force reconstruction of MON data even if the cached MON file exists.
 REPARSE_MON = False
@@ -95,15 +127,109 @@ def main() -> None:
     working_dir.mkdir(exist_ok=True)
 
     mon_data = get_mon_data(working_dir)
-    frd_data = get_frd_data(working_dir, mon_data[:5])
+    frd_data = get_frd_data(working_dir, mon_data)
 
     logger.info("\n%s", frd_data)
 
 
+def load_cached_csv(
+    filepath: Path,
+    dtypes: CSV_DTYPE_MAP | None = None,
+) -> pd.DataFrame | None:
+    """Safely load a CSV cache file. Returns None if invalid, empty, or corrupted."""
+    if not filepath.is_file() or filepath.stat().st_size == 0:
+        return None
+    try:
+        return pd.read_csv(filepath, dtype=dtypes, low_memory=False)
+    except (ValueError, KeyError, pd.errors.ParserError, pd.errors.EmptyDataError) as e:
+        logger.warning("Invalidating CSV cache at %s due to read error: %s", filepath, e)
+        return None
+
+
+def validate_nav_set(nav_set_df: pd.DataFrame) -> None:
+    """Validate columns and numeric geographic inputs required by FRD generation."""
+    required_columns = {
+        "NAV_ID",
+        "LAT_DECIMAL",
+        "LONG_DECIMAL",
+        "ELEV",
+        "MAG_VARN",
+        "ALT_CODE",
+    }
+    missing_columns = required_columns - set(nav_set_df.columns)
+    if missing_columns:
+        raise ValueError(
+            f"MON data is missing required columns: {sorted(missing_columns)}"
+        )
+
+    if nav_set_df.empty:
+        raise ValueError("MON data contains no navigation facilities")
+
+    numeric_columns = [
+        "LAT_DECIMAL",
+        "LONG_DECIMAL",
+        "MAG_VARN",
+    ]
+    for column in numeric_columns:
+        values = pd.to_numeric(
+            nav_set_df[column],
+            errors="coerce",
+        )
+        if values.isna().any():
+            raise ValueError(
+                f"MON data contains non-numeric or missing values in {column!r}"
+            )
+
+    latitudes = pd.to_numeric(
+        nav_set_df["LAT_DECIMAL"],
+        errors="coerce",
+    )
+    longitudes = pd.to_numeric(
+        nav_set_df["LONG_DECIMAL"],
+        errors="coerce",
+    )
+
+    if not latitudes.between(-90.0, 90.0).all():
+        raise ValueError("MON data contains latitude outside [-90, 90]")
+
+    if not longitudes.between(-180.0, 180.0).all():
+        raise ValueError("MON data contains longitude outside [-180, 180]")
+
+    unknown_ssvs = set(nav_set_df["ALT_CODE"].dropna()) - {
+        rule[0] for rule in RAW_SERVICE_VOLUMES_VOR
+    }
+    if unknown_ssvs:
+        raise ValueError(
+            f"MON data contains unsupported ALT_CODE values: {sorted(unknown_ssvs)}"
+        )
+
+
+def validate_frd_data(frd_data: pd.DataFrame) -> None:
+    """Validate generated FRD cache shape before reusing it."""
+    missing_columns = set(FRD_COLUMNS) - set(frd_data.columns)
+    if missing_columns:
+        raise ValueError(
+            f"FRD data is missing required columns: {sorted(missing_columns)}"
+        )
+
+    if frd_data.empty:
+        raise ValueError("FRD data contains no generated points")
+
+
 def get_frd_data(working_dir: Path, mon_data: pd.DataFrame) -> pd.DataFrame:
     frd_data_file = working_dir / FRD_DATA_FILENAME
+    frd_data = None
 
-    if REPARSE_FRD or not frd_data_file.is_file():
+    if not REPARSE_FRD and frd_data_file.is_file() and frd_data_file.stat().st_size > 0:
+        try:
+            logger.info("Loading FRD data from %s...", frd_data_file)
+            frd_data = pd.read_parquet(frd_data_file)
+            validate_frd_data(frd_data)
+        except Exception as e:
+            logger.warning("Invalidating FRD cache due to read error: %s", e)
+            frd_data = None
+
+    if frd_data is None:
         logger.info("Constructing FRD data at %s...", frd_data_file)
         frd_data = generate_frd_data(
             nav_set_df=mon_data,
@@ -114,32 +240,40 @@ def get_frd_data(working_dir: Path, mon_data: pd.DataFrame) -> pd.DataFrame:
             end_radial=359.0,
             radial_step=1.0,
         )
+        validate_frd_data(frd_data)
         frd_data.to_parquet(frd_data_file, index=False)
         logger.info("Saved FRD data to %s...", frd_data_file)
-    else:
-        logger.info("Loading FRD data from %s...", frd_data_file)
-        frd_data = pd.read_parquet(frd_data_file)
 
     return frd_data
 
 
 def get_mon_data(working_dir: Path) -> pd.DataFrame:
     mon_data_file = working_dir / MON_DATA_FILENAME
+    mon_data = None
 
-    if REPARSE_MON or not mon_data_file.is_file():
+    if not REPARSE_MON:
+        logger.info("Attempting to load MON data from %s...", mon_data_file)
+        mon_data = load_cached_csv(mon_data_file, dtypes=MON_SCHEMA)
+
+    if mon_data is None:
         logger.info("Constructing MON data at %s...", mon_data_file)
         mon_data = construct_mon_data(working_dir)
-    else:
-        logger.info("Loading MON data from %s...", mon_data_file)
-        mon_data = pd.read_csv(mon_data_file)
+        mon_data.to_csv(mon_data_file, index=False)
+        logger.info("Saved MON data to %s...", mon_data_file)
 
+    validate_nav_set(mon_data)
     return mon_data
 
 
 def construct_mon_data(working_dir: Path) -> pd.DataFrame:
     # Load or fetch RET data.
     ret_file = working_dir / VOR_RETENTION_SOURCE["filename"]
-    if REDOWNLOAD or not ret_file.is_file():
+    ret_data = None if REDOWNLOAD_VOR_RET else load_cached_csv(
+        ret_file,
+        dtypes={VOR_RETENTION_SOURCE["id_column"]: "str"}
+    )
+
+    if ret_data is None:
         url = VOR_RETENTION_SOURCE["url"]
         logger.info("Fetching RET data from %s...", url)
         response = requests.get(url, timeout=30)
@@ -147,13 +281,12 @@ def construct_mon_data(working_dir: Path) -> pd.DataFrame:
         ret_data = pd.read_excel(io.BytesIO(response.content))
         ret_data = strip_metadata_rows(ret_data)
         ret_data.to_csv(ret_file, index=False)
-    else:
-        logger.info("Loading RET data from %s...", ret_file)
-        ret_data = pd.read_csv(ret_file)
 
     # Load or fetch NAV data.
     nav_data_file = working_dir / NAV_DATA_SOURCE["filename"]
-    if REDOWNLOAD or not nav_data_file.is_file():
+    nav_data = None if REDOWNLOAD_VOR_RET else load_cached_csv(nav_data_file, dtypes=NAV_SCHEMA)
+
+    if nav_data is None:
         url = NAV_DATA_SOURCE["url"]
         logger.info("Fetching NAV data from %s...", url)
         response = requests.get(url, timeout=30)
@@ -165,25 +298,22 @@ def construct_mon_data(working_dir: Path) -> pd.DataFrame:
                 raise ValueError(f"{internal_name!r} was not found in FAA NAV archive")
 
             with zip_file.open(internal_name) as file:
-                nav_data = pd.read_csv(file)
+                nav_data = pd.read_csv(file, dtype=NAV_SCHEMA, low_memory=False)
 
         nav_data.to_csv(nav_data_file, index=False)
-    else:
-        logger.info("Loading NAV data from %s...", nav_data_file)
-        nav_data = pd.read_csv(nav_data_file)
 
     required_nav_columns = set(NAV_DATA_SOURCE["keep_columns"])
     missing_nav_columns = required_nav_columns - set(nav_data.columns)
     if missing_nav_columns:
         raise ValueError(
-            f"NAV data is missing required columns: " f"{sorted(missing_nav_columns)}"
+            f"NAV data is missing required columns: {sorted(missing_nav_columns)}"
         )
 
     required_ret_columns = {VOR_RETENTION_SOURCE["id_column"]}
     missing_ret_columns = required_ret_columns - set(ret_data.columns)
     if missing_ret_columns:
         raise ValueError(
-            f"RET data is missing required columns: " f"{sorted(missing_ret_columns)}"
+            f"RET data is missing required columns: {sorted(missing_ret_columns)}"
         )
 
     # Keep NAV facilities whose IDs occur in the VOR retention list.
@@ -210,12 +340,6 @@ def construct_mon_data(working_dir: Path) -> pd.DataFrame:
         pd.to_numeric,
         errors="coerce",
     )
-
-    validate_nav_set(nav_data)
-
-    mon_data_file = working_dir / MON_DATA_FILENAME
-    nav_data.to_csv(mon_data_file, index=False)
-    logger.info("Saved MON data to %s...", mon_data_file)
 
     return nav_data
 
@@ -553,64 +677,6 @@ def make_inclusive_range(
     """Return a fixed-step range whose endpoint is guaranteed inclusive."""
     count = int(round((end - start) / step))
     return start + np.arange(count + 1, dtype=float) * step
-
-
-def validate_nav_set(nav_set_df: pd.DataFrame) -> None:
-    """Validate columns and numeric geographic inputs required by FRD generation."""
-    required_columns = {
-        "NAV_ID",
-        "LAT_DECIMAL",
-        "LONG_DECIMAL",
-        "ELEV",
-        "MAG_VARN",
-        "ALT_CODE",
-    }
-    missing_columns = required_columns - set(nav_set_df.columns)
-    if missing_columns:
-        raise ValueError(
-            f"MON data is missing required columns: {sorted(missing_columns)}"
-        )
-
-    if nav_set_df.empty:
-        raise ValueError("MON data contains no navigation facilities")
-
-    numeric_columns = [
-        "LAT_DECIMAL",
-        "LONG_DECIMAL",
-        "MAG_VARN",
-    ]
-    for column in numeric_columns:
-        values = pd.to_numeric(
-            nav_set_df[column],
-            errors="coerce",
-        )
-        if values.isna().any():
-            raise ValueError(
-                f"MON data contains non-numeric or missing values in {column!r}"
-            )
-
-    latitudes = pd.to_numeric(
-        nav_set_df["LAT_DECIMAL"],
-        errors="coerce",
-    )
-    longitudes = pd.to_numeric(
-        nav_set_df["LONG_DECIMAL"],
-        errors="coerce",
-    )
-
-    if not latitudes.between(-90.0, 90.0).all():
-        raise ValueError("MON data contains latitude outside [-90, 90]")
-
-    if not longitudes.between(-180.0, 180.0).all():
-        raise ValueError("MON data contains longitude outside [-180, 180]")
-
-    unknown_ssvs = set(nav_set_df["ALT_CODE"].dropna()) - {
-        rule[0] for rule in RAW_SERVICE_VOLUMES_VOR
-    }
-    if unknown_ssvs:
-        raise ValueError(
-            f"MON data contains unsupported ALT_CODE values: " f"{sorted(unknown_ssvs)}"
-        )
 
 
 if __name__ == "__main__":
