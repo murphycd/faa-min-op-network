@@ -129,21 +129,6 @@ RAW_SERVICE_VOLUMES_VOR = (
 WGS84 = Geodesic.WGS84
 
 
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-
-    working_dir = Path(__file__).resolve().parent / "data"
-    working_dir.mkdir(exist_ok=True)
-
-    mon_data = get_mon_data(working_dir)
-    frd_data = get_frd_data(working_dir, mon_data)
-
-    logger.info("\n%s", frd_data)
-
-
 def load_cached_csv(
     filepath: Path,
     dtypes: CSV_DTYPE_MAP | None = None,
@@ -755,6 +740,65 @@ def make_inclusive_range(
     """Return a fixed-step range whose endpoint is guaranteed inclusive."""
     count = int(round((end - start) / step))
     return start + np.arange(count + 1, dtype=float) * step
+
+
+def render_plot(frd_data: pd.DataFrame, output_html_file: Path) -> None:
+    import plotly.graph_objects as go
+
+    # TODO: don't sample, use all
+    sample = frd_data.sample(min(10000, len(frd_data))).copy()
+    sample["generated_lat"] = pd.to_numeric(sample["generated_lat"], errors="coerce")
+    sample["generated_lon"] = pd.to_numeric(sample["generated_lon"], errors="coerce")
+    sample = sample.dropna(subset=["generated_lat", "generated_lon"])
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scattergeo(
+            lat=sample["generated_lat"],
+            lon=sample["generated_lon"],
+            mode="markers",
+            marker=dict(size=3, opacity=0.5),
+        )
+    )
+
+    fig.update_layout(
+        title=f"FRD Data Points ({len(sample):,} sample)",
+        geo=dict(scope="usa"),
+        height=700,
+        width=1000,
+    )
+
+    fig.write_html(str(output_html_file))
+
+    print(f"Map saved to: {output_html_file}")
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    working_dir = Path(__file__).resolve().parent / "data"
+    working_dir.mkdir(exist_ok=True)
+
+    mon_data = get_mon_data(working_dir)
+    frd_data = get_frd_data(working_dir, mon_data)
+
+    # Create FRD column
+    # For rows where distance > 0, append radial and distance (both zero-padded to 3 digits)
+    frd_data["frd"] = frd_data["parent_id"].astype(str)
+    mask = frd_data["distance"] > 0
+    frd_data.loc[mask, "frd"] = (
+        frd_data.loc[mask, "parent_id"].astype(str)
+        + frd_data.loc[mask, "radial"].astype(int).astype(str).str.zfill(3)
+        + frd_data.loc[mask, "distance"].astype(int).astype(str).str.zfill(3)
+    )
+
+    logger.info("\n%s", frd_data)
+
+    render_plot(frd_data, working_dir / "frd_map.html")
 
 
 if __name__ == "__main__":

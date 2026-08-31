@@ -10,7 +10,8 @@ dependencies = [
     "openpyxl",
     "requests",
     "isort",
-    "pyarrow>=25.0.1",
+    "pyarrow",
+    "plotly",
 ]
 
 [project.scripts]
