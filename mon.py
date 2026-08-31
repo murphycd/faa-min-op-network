@@ -278,10 +278,6 @@ def compact_frd_data(frd_data: pd.DataFrame) -> pd.DataFrame:
 
         compacted[column] = integer_values.to_numpy(dtype=np.dtype(dtype))
 
-    # sort by lat/lon allow Run-Length Encoding to be more effective when compressing the parquet file
-    compacted.sort_values(by=["generated_lat", "generated_lon"], inplace=True)
-    compacted.reset_index(drop=True, inplace=True)
-
     return compacted
 
 
@@ -315,7 +311,6 @@ def get_frd_data(working_dir: Path, mon_data: pd.DataFrame) -> pd.DataFrame:
             frd_data_file,
             compression=FRD_PARQUET_COMPRESSION,
             compression_level=FRD_PARQUET_COMPRESSION_LEVEL,
-            use_dictionary=True,
             index=False,
         )
         logger.info("Saved FRD data to %s...", frd_data_file)
