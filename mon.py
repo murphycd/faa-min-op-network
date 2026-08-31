@@ -22,8 +22,16 @@ import requests
 from geographiclib.geodesic import Geodesic
 from pandas._typing import DtypeArg
 
-logger = logging.getLogger(__name__)
+# Force redownload of FAA source data even if cached files already exist.
+REDOWNLOAD_VOR_RET = False
 
+# Force reconstruction of MON data even if the cached MON file exists.
+REPARSE_MON = False
+
+# Force reconstruction of FRD data even if the cached FRD file exists.
+REPARSE_FRD = False
+
+logger = logging.getLogger(__name__)
 
 # https://www.faa.gov/ato/navigation-programs/vor-retention-list
 VOR_RETENTION_SOURCE = {
@@ -86,6 +94,19 @@ FRD_COLUMNS = [
     "max_alt",
 ]
 
+FRD_DTYPES = {
+    "generated_lat": np.float32,
+    "generated_lon": np.float32,
+    "radial": np.uint16,
+    "distance": np.uint8,
+    "min_alt": np.uint16,
+    "max_alt": np.uint16,
+}
+FRD_LATLON_PRECISION = 4  # decimal places for lat/lon rounding
+
+FRD_PARQUET_COMPRESSION = "brotli"
+FRD_PARQUET_COMPRESSION_LEVEL = 5
+
 # Standard service-volume rules:
 # (class, minimum altitude AGL, maximum altitude AGL, maximum distance NM)
 RAW_SERVICE_VOLUMES_VOR = (
@@ -103,15 +124,6 @@ RAW_SERVICE_VOLUMES_VOR = (
     ("VH", 18000, 45000, 130),
     ("VH", 45001, 60000, 100),
 )
-
-# Force redownload of FAA source data even if cached files already exist.
-REDOWNLOAD_VOR_RET = False
-
-# Force reconstruction of MON data even if the cached MON file exists.
-REPARSE_MON = False
-
-# Force reconstruction of FRD data even if the cached FRD file exists.
-REPARSE_FRD = False
 
 # WGS84 ellipsoid used for the geodesic destination calculation.
 WGS84 = Geodesic.WGS84
@@ -142,7 +154,9 @@ def load_cached_csv(
     try:
         return pd.read_csv(filepath, dtype=dtypes, low_memory=False)
     except (ValueError, KeyError, pd.errors.ParserError, pd.errors.EmptyDataError) as e:
-        logger.warning("Invalidating CSV cache at %s due to read error: %s", filepath, e)
+        logger.warning(
+            "Invalidating CSV cache at %s due to read error: %s", filepath, e
+        )
         return None
 
 
@@ -216,6 +230,61 @@ def validate_frd_data(frd_data: pd.DataFrame) -> None:
         raise ValueError("FRD data contains no generated points")
 
 
+def compact_frd_data(frd_data: pd.DataFrame) -> pd.DataFrame:
+    """Return FRD data using compact storage dtypes."""
+    validate_frd_data(frd_data)
+
+    compacted = frd_data.copy()
+    # Round to fixed decimal places, then cast to float32
+    compacted["generated_lat"] = (
+        compacted["generated_lat"]
+        .round(FRD_LATLON_PRECISION)
+        .astype(FRD_DTYPES["generated_lat"])
+    )
+
+    compacted["generated_lon"] = (
+        compacted["generated_lon"]
+        .round(FRD_LATLON_PRECISION)
+        .astype(FRD_DTYPES["generated_lon"])
+    )
+
+    for column, dtype in (
+        ("radial", FRD_DTYPES["radial"]),
+        ("distance", FRD_DTYPES["distance"]),
+        ("min_alt", FRD_DTYPES["min_alt"]),
+        ("max_alt", FRD_DTYPES["max_alt"]),
+    ):
+        values = pd.to_numeric(compacted[column], errors="raise")
+        float_values = values.to_numpy(dtype=float)
+        if np.isnan(float_values).any():
+            raise ValueError(f"FRD column {column!r} contains missing values")
+
+        rounded = np.rint(float_values)
+        if column in {"radial", "distance"} and not np.array_equal(
+            float_values,
+            rounded,
+        ):
+            raise ValueError(
+                f"FRD column {column!r} cannot be safely rounded to {dtype}"
+            )
+
+        if column in {"min_alt", "max_alt"}:
+            # Caps values at 65535, keeping 0 as the lower floor
+            rounded = np.clip(rounded, a_min=0, a_max=65535)
+
+        integer_values = pd.Series(rounded, index=compacted.index)
+        if integer_values.lt(0).any() or integer_values.gt(np.iinfo(dtype).max).any():
+            raise ValueError(f"FRD column {column!r} contains values outside {dtype}")
+
+        compacted[column] = integer_values.to_numpy(dtype=np.dtype(dtype))
+
+    # sort by lat/lon allow Run-Length Encoding to be more effective when compressing the parquet file
+    compacted.sort_values(by=["generated_lat", "generated_lon"], inplace=True)
+    compacted.reset_index(drop=True, inplace=True)
+
+    return compacted
+
+
 def get_frd_data(working_dir: Path, mon_data: pd.DataFrame) -> pd.DataFrame:
     frd_data_file = working_dir / FRD_DATA_FILENAME
     frd_data = None
@@ -240,8 +309,15 @@ def get_frd_data(working_dir: Path, mon_data: pd.DataFrame) -> pd.DataFrame:
             end_radial=359.0,
             radial_step=1.0,
         )
+        frd_data = compact_frd_data(frd_data)
         validate_frd_data(frd_data)
-        frd_data.to_parquet(frd_data_file, index=False)
+        frd_data.to_parquet(
+            frd_data_file,
+            compression=FRD_PARQUET_COMPRESSION,
+            compression_level=FRD_PARQUET_COMPRESSION_LEVEL,
+            use_dictionary=True,
+            index=False,
+        )
         logger.info("Saved FRD data to %s...", frd_data_file)
 
     return frd_data
@@ -268,9 +344,12 @@ def get_mon_data(working_dir: Path) -> pd.DataFrame:
 def construct_mon_data(working_dir: Path) -> pd.DataFrame:
     # Load or fetch RET data.
     ret_file = working_dir / VOR_RETENTION_SOURCE["filename"]
-    ret_data = None if REDOWNLOAD_VOR_RET else load_cached_csv(
-        ret_file,
-        dtypes={VOR_RETENTION_SOURCE["id_column"]: "str"}
+    ret_data = (
+        None
+        if REDOWNLOAD_VOR_RET
+        else load_cached_csv(
+            ret_file, dtypes={VOR_RETENTION_SOURCE["id_column"]: "str"}
+        )
     )
 
     if ret_data is None:
@@ -284,7 +363,11 @@ def construct_mon_data(working_dir: Path) -> pd.DataFrame:
 
     # Load or fetch NAV data.
     nav_data_file = working_dir / NAV_DATA_SOURCE["filename"]
-    nav_data = None if REDOWNLOAD_VOR_RET else load_cached_csv(nav_data_file, dtypes=NAV_SCHEMA)
+    nav_data = (
+        None
+        if REDOWNLOAD_VOR_RET
+        else load_cached_csv(nav_data_file, dtypes=NAV_SCHEMA)
+    )
 
     if nav_data is None:
         url = NAV_DATA_SOURCE["url"]
