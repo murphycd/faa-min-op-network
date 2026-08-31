@@ -95,9 +95,9 @@ def main() -> None:
     working_dir.mkdir(exist_ok=True)
 
     mon_data = get_mon_data(working_dir)
-    frd_data = get_frd_data(working_dir, mon_data)
+    frd_data = get_frd_data(working_dir, mon_data[:5])
 
-    logger.info("%s", frd_data)
+    logger.info("\n%s", frd_data)
 
 
 def get_frd_data(working_dir: Path, mon_data: pd.DataFrame) -> pd.DataFrame:
