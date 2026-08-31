@@ -5,11 +5,13 @@
 #   "numpy",
 #   "openpyxl",
 #   "pandas",
+#   "pyarrow",
 #   "requests",
 # ]
 # ///
 
 import io
+import logging
 import zipfile
 from pathlib import Path
 
@@ -17,6 +19,8 @@ import numpy as np
 import pandas as pd
 import requests
 from geographiclib.geodesic import Geodesic
+
+logger = logging.getLogger(__name__)
 
 
 # https://www.faa.gov/ato/navigation-programs/vor-retention-list
@@ -46,6 +50,8 @@ NAV_DATA_SOURCE = {
 
 MON_DATA_FILENAME = "mon_data.csv"
 
+FRD_DATA_FILENAME = "frd_data.parquet"
+
 VALID_NAV_TYPES = frozenset({"VOR", "VOR/DME", "VORTAC"})
 
 # Standard service-volume rules:
@@ -72,37 +78,59 @@ REDOWNLOAD = False
 # Force reconstruction of MON data even if the cached MON file exists.
 REPARSE = False
 
+# Force reconstruction of FRD data even if the cached FRD file exists.
+REPARSE_FRD = False
+
 # WGS84 ellipsoid used for the geodesic destination calculation.
 WGS84 = Geodesic.WGS84
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
     working_dir = Path(__file__).resolve().parent / "data"
     working_dir.mkdir(exist_ok=True)
 
     mon_data = get_mon_data(working_dir)
+    frd_data = get_frd_data(working_dir, mon_data)
 
-    frd_data = generate_frd_data(
-        nav_set_df=mon_data,
-        step_dist=1.0,
-        start_dist=0.0,
-        end_dist=130.0,
-        start_radial=0.0,
-        end_radial=359.0,
-        radial_step=1.0,
-    )
+    logger.info("%s", frd_data)
 
-    print(frd_data)
+
+def get_frd_data(working_dir: Path, mon_data: pd.DataFrame) -> pd.DataFrame:
+    frd_data_file = working_dir / FRD_DATA_FILENAME
+
+    if REPARSE_FRD or not frd_data_file.is_file():
+        logger.info("Constructing FRD data at %s...", frd_data_file)
+        frd_data = generate_frd_data(
+            nav_set_df=mon_data,
+            step_dist=1.0,
+            start_dist=0.0,
+            end_dist=130.0,
+            start_radial=0.0,
+            end_radial=359.0,
+            radial_step=1.0,
+        )
+        frd_data.to_parquet(frd_data_file, index=False)
+        logger.info("Saved FRD data to %s...", frd_data_file)
+    else:
+        logger.info("Loading FRD data from %s...", frd_data_file)
+        frd_data = pd.read_parquet(frd_data_file)
+
+    return frd_data
 
 
 def get_mon_data(working_dir: Path) -> pd.DataFrame:
     mon_data_file = working_dir / MON_DATA_FILENAME
 
     if REPARSE or not mon_data_file.is_file():
-        print(f"Constructing MON data at {mon_data_file}...")
+        logger.info("Constructing MON data at %s...", mon_data_file)
         mon_data = construct_mon_data(working_dir)
     else:
-        print(f"Loading MON data from {mon_data_file}...")
+        logger.info("Loading MON data from %s...", mon_data_file)
         mon_data = pd.read_csv(mon_data_file)
 
     return mon_data
@@ -113,65 +141,57 @@ def construct_mon_data(working_dir: Path) -> pd.DataFrame:
     ret_file = working_dir / VOR_RETENTION_SOURCE["filename"]
     if REDOWNLOAD or not ret_file.is_file():
         url = VOR_RETENTION_SOURCE["url"]
-        print(f"Fetching RET data from {url}...")
+        logger.info("Fetching RET data from %s...", url)
         response = requests.get(url, timeout=30)
         response.raise_for_status()
         ret_data = pd.read_excel(io.BytesIO(response.content))
         ret_data = strip_metadata_rows(ret_data)
         ret_data.to_csv(ret_file, index=False)
     else:
-        print(f"Loading RET data from {ret_file}...")
+        logger.info("Loading RET data from %s...", ret_file)
         ret_data = pd.read_csv(ret_file)
 
     # Load or fetch NAV data.
     nav_data_file = working_dir / NAV_DATA_SOURCE["filename"]
     if REDOWNLOAD or not nav_data_file.is_file():
         url = NAV_DATA_SOURCE["url"]
-        print(f"Fetching NAV data from {url}...")
+        logger.info("Fetching NAV data from %s...", url)
         response = requests.get(url, timeout=30)
         response.raise_for_status()
 
         with zipfile.ZipFile(io.BytesIO(response.content)) as zip_file:
             internal_name = NAV_DATA_SOURCE["internal_name"]
             if internal_name not in zip_file.namelist():
-                raise ValueError(
-                    f"{internal_name!r} was not found in FAA NAV archive"
-                )
+                raise ValueError(f"{internal_name!r} was not found in FAA NAV archive")
 
             with zip_file.open(internal_name) as file:
                 nav_data = pd.read_csv(file)
 
         nav_data.to_csv(nav_data_file, index=False)
     else:
-        print(f"Loading NAV data from {nav_data_file}...")
+        logger.info("Loading NAV data from %s...", nav_data_file)
         nav_data = pd.read_csv(nav_data_file)
 
     required_nav_columns = set(NAV_DATA_SOURCE["keep_columns"])
     missing_nav_columns = required_nav_columns - set(nav_data.columns)
     if missing_nav_columns:
         raise ValueError(
-            f"NAV data is missing required columns: "
-            f"{sorted(missing_nav_columns)}"
+            f"NAV data is missing required columns: " f"{sorted(missing_nav_columns)}"
         )
 
     required_ret_columns = {VOR_RETENTION_SOURCE["id_column"]}
     missing_ret_columns = required_ret_columns - set(ret_data.columns)
     if missing_ret_columns:
         raise ValueError(
-            f"RET data is missing required columns: "
-            f"{sorted(missing_ret_columns)}"
+            f"RET data is missing required columns: " f"{sorted(missing_ret_columns)}"
         )
 
     # Keep NAV facilities whose IDs occur in the VOR retention list.
     valid_ids = set(ret_data[VOR_RETENTION_SOURCE["id_column"]])
-    nav_data = nav_data[
-        nav_data[NAV_DATA_SOURCE["id_column"]].isin(valid_ids)
-    ]
+    nav_data = nav_data[nav_data[NAV_DATA_SOURCE["id_column"]].isin(valid_ids)]
 
     # Keep VOR-type facilities only.
-    nav_data = nav_data[
-        nav_data["NAV_TYPE"].isin(VALID_NAV_TYPES)
-    ].copy()
+    nav_data = nav_data[nav_data["NAV_TYPE"].isin(VALID_NAV_TYPES)].copy()
 
     # Keep only the columns required downstream.
     nav_data = nav_data.loc[
@@ -195,7 +215,7 @@ def construct_mon_data(working_dir: Path) -> pd.DataFrame:
 
     mon_data_file = working_dir / MON_DATA_FILENAME
     nav_data.to_csv(mon_data_file, index=False)
-    print(f"Saved MON data to {mon_data_file}...")
+    logger.info("Saved MON data to %s...", mon_data_file)
 
     return nav_data
 
@@ -214,13 +234,7 @@ def strip_metadata_rows(df: pd.DataFrame) -> pd.DataFrame:
     if header_idx is None:
         raise ValueError("Could not locate RET header row containing 'ID'")
 
-    new_columns = (
-        df.iloc[header_idx]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-        .tolist()
-    )
+    new_columns = df.iloc[header_idx].fillna("").astype(str).str.strip().tolist()
 
     df_cleaned = df.iloc[header_idx + 1 :].copy()
     df_cleaned.columns = new_columns
@@ -230,11 +244,11 @@ def strip_metadata_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 def generate_frd_data(
     nav_set_df: pd.DataFrame,
-    step_dist: float, # nautical miles
-    start_dist: float, # nautical miles
+    step_dist: float,  # nautical miles
+    start_dist: float,  # nautical miles
     end_dist: float,
-    start_radial: float, # magnetic degrees
-    end_radial: float, # inclusive
+    start_radial: float,  # magnetic degrees
+    end_radial: float,  # inclusive
     radial_step: float,
 ) -> pd.DataFrame:
     """Generate an FRD grid around each VOR in ``nav_set_df``.
@@ -299,6 +313,11 @@ def generate_frd_data(
     lons = nav_set_df["LONG_DECIMAL"].to_numpy(dtype=float)[:, np.newaxis]
     mag_vars = nav_set_df["MAG_VARN"].to_numpy(dtype=float)[:, np.newaxis]
 
+    logger.info(
+        "Computing %d geodesic points for %d navaids...",
+        len(nav_set_df) * points_per_seed,
+        len(nav_set_df),
+    )
     new_lat, new_lon = calc_frd_to_lat_lon(
         lats=lats,
         lons=lons,
@@ -393,6 +412,9 @@ def calc_frd_to_lat_lon(
     new_lat = np.empty(lat_values.size, dtype=float)
     new_lon = np.empty(lon_values.size, dtype=float)
 
+    total_points = lat_values.size
+    log_interval = max(total_points // 100, 1)
+
     for i, (lat, lon, bearing, distance) in enumerate(
         zip(
             lat_values,
@@ -410,6 +432,14 @@ def calc_frd_to_lat_lon(
         )
         new_lat[i] = result["lat2"]
         new_lon[i] = result["lon2"]
+
+        if (i + 1) % log_interval == 0 or i + 1 == total_points:
+            logger.info(
+                "Computed %d/%d geodesic points (%.1f%%)",
+                i + 1,
+                total_points,
+                100.0 * (i + 1) / total_points,
+            )
 
     return new_lat.reshape(output_shape), new_lon.reshape(output_shape)
 
@@ -439,11 +469,7 @@ def calculate_service_volume_altitudes(
         class_min = np.full(class_distances.shape, np.inf, dtype=float)
         class_max = np.full(class_distances.shape, -np.inf, dtype=float)
 
-        rules = [
-            rule
-            for rule in RAW_SERVICE_VOLUMES_VOR
-            if rule[0] == ssv_class
-        ]
+        rules = [rule for rule in RAW_SERVICE_VOLUMES_VOR if rule[0] == ssv_class]
 
         if not rules:
             raise ValueError(
@@ -512,7 +538,7 @@ def validate_grid_parameters(
 def is_step_aligned(start: float, end: float, step: float) -> bool:
     """Return whether ``end`` is an integer number of steps from ``start``."""
     steps = (end - start) / step
-    return np.isclose(steps, round(steps), rtol=0.0, atol=1e-10)
+    return bool(np.isclose(steps, round(steps), rtol=0.0, atol=1e-10))
 
 
 def make_inclusive_range(
@@ -580,8 +606,7 @@ def validate_nav_set(nav_set_df: pd.DataFrame) -> None:
     }
     if unknown_ssvs:
         raise ValueError(
-            f"MON data contains unsupported ALT_CODE values: "
-            f"{sorted(unknown_ssvs)}"
+            f"MON data contains unsupported ALT_CODE values: " f"{sorted(unknown_ssvs)}"
         )
 
 
