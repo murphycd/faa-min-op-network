@@ -76,7 +76,7 @@ RAW_SERVICE_VOLUMES_VOR = (
 REDOWNLOAD = False
 
 # Force reconstruction of MON data even if the cached MON file exists.
-REPARSE = False
+REPARSE_MON = False
 
 # Force reconstruction of FRD data even if the cached FRD file exists.
 REPARSE_FRD = False
@@ -126,7 +126,7 @@ def get_frd_data(working_dir: Path, mon_data: pd.DataFrame) -> pd.DataFrame:
 def get_mon_data(working_dir: Path) -> pd.DataFrame:
     mon_data_file = working_dir / MON_DATA_FILENAME
 
-    if REPARSE or not mon_data_file.is_file():
+    if REPARSE_MON or not mon_data_file.is_file():
         logger.info("Constructing MON data at %s...", mon_data_file)
         mon_data = construct_mon_data(working_dir)
     else:
@@ -358,7 +358,7 @@ def generate_frd_data(
         elevations=flat_elev,
     )
 
-    return pd.DataFrame(
+    frd_df = pd.DataFrame(
         {
             "parent_id": flat_ids,
             "generated_lat": flat_lat,
@@ -369,6 +369,9 @@ def generate_frd_data(
             "max_alt": flat_max_alt,
         }
     )
+
+    # Exclude points falling outside the operational service volume limits of each navaid class.
+    return frd_df.dropna(subset=["min_alt", "max_alt"]).reset_index(drop=True)
 
 
 def calc_frd_to_lat_lon(
